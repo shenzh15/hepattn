@@ -1,0 +1,11 @@
+#+UseOS = "el9"
++SingularityImage = "/data/bfys/shenzh/4Dtracking/hepattn/pixi.sif"
++JobCategory = "short"
+request_gpus = 1
+request_cpus = 2
+request_memory = 16G
+should_transfer_files = yes
+when_to_transfer_output = on_exit
+requirements = regexp("L40S", TARGET.GPUs_DeviceName)
+
+queue

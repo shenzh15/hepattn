@@ -3,7 +3,8 @@ from pathlib import Path
 
 import awkward as ak
 import h5py
-import numba
+
+# import numba
 import numpy as np
 import uproot
 import os
@@ -170,7 +171,7 @@ output_masks = [
 ]
 
 
-@numba.njit()
+# @numba.njit()
 def build_track_hit_mask_bcodes(tracks_bcode, hits_bcodes):
     track_hit_mask = np.zeros(shape=(len(tracks_bcode), len(hits_bcodes)), dtype=np.bool_)
 
@@ -183,7 +184,7 @@ def build_track_hit_mask_bcodes(tracks_bcode, hits_bcodes):
     return track_hit_mask
 
 
-@numba.njit()
+# @numba.njit()
 def build_track_hit_mask_ids(tracks_hits_ids, hits_id):
     track_hit_mask = np.zeros(shape=(len(tracks_hits_ids), len(hits_id)), dtype=np.bool_)
 
