@@ -30,26 +30,33 @@ class GradientLoggerCallback(Callback):
         if trainer.global_step % self.log_every_n_steps == 0:
             total_grad_magnitude = 0.0
             total_params = 0
+            grad_norm_squared = 0.0  # For computing global L2 norm
+
             for name, param in pl_module.named_parameters():
                 if param.grad is not None:
                     grad_magnitude = param.grad.norm().item()
                     total_grad_magnitude += grad_magnitude
                     total_params += param.grad.numel()
+                    # Accumulate squared norms for global norm (this is what Lightning clips!)
+                    grad_norm_squared += grad_magnitude ** 2
                     # Log gradient statistics
-                    grad_mean = param.grad.mean().item()
-                    grad_std = param.grad.std().item()
-                    self.log({f"grad/{name}_mean": grad_mean, f"grad/{name}_std": grad_std}, "gradients")
+                    # grad_mean = param.grad.mean().item()
+                    # grad_std = param.grad.std().item()
+                    # self.log({f"grad/{name}_mean": grad_mean, f"grad/{name}_std": grad_std}, "gradients")
 
-                else:
-                    self.log({f"grad/{name}_mean": None, f"grad/{name}_std": None}, "gradients")
+                # else:
+                #     self.log({f"grad/{name}_mean": None, f"grad/{name}_std": None}, "gradients")
 
-            # Log total gradient magnitude or average magnitude
+            # Log gradient norms
             if total_params > 0:
                 avg_grad_magnitude = total_grad_magnitude / total_params
+                # Compute global gradient norm (L2 norm) - THIS is what gets clipped by Lightning!
+                global_norm = grad_norm_squared ** 0.5
                 self.log(
                     {
-                        "total_magnitude": total_grad_magnitude,
-                        "average_magnitude": avg_grad_magnitude,
+                        "total_magnitude": total_grad_magnitude,  # L1-like sum (legacy, not clipped)
+                        "average_magnitude": avg_grad_magnitude,  # Average (legacy, not clipped)
+                        "global_norm": global_norm,  # IMPORTANT: This is compared to gradient_clip_val!
                     },
                     "gradient",
                 )

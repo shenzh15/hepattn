@@ -1,6 +1,6 @@
 seed_everything: 42
 
-name: lhcb_vertex_reconstruction
+name: gradient_clip_val_5_baseline
 
 data:
   train_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version3_hdf5/train.h5
@@ -8,13 +8,13 @@ data:
   test_path: null  # Optional, only needed for testing
 
   # DataLoader parameters
-  batch_size: 4
-  num_workers: 8
+  batch_size: 64
+  num_workers: 2
   pin_memory: true
 
   # Number of events to use (-1 means all)
   num_train: -1
-  num_val: 100
+  num_val: 2000
   num_test: -1
 
   # Maximum vertices per event (events with more will be filtered)
@@ -28,8 +28,8 @@ data:
     tracks:
       - 'backward'
       - 'c00'
-      - 'c31'
-      - 'c33'
+      - 'c20'
+      - 'c22'
       - 'c55'
       - 'chi2'
       - 'beamPOCA_tx'
@@ -42,20 +42,18 @@ data:
   # Target features
   targets:
     vertex:
-      - 'ovtx_x'
-      - 'ovtx_y'
       - 'ovtx_z'
       - 'ovtx_t'
       - 'is_pv'
 
 trainer:
-  max_epochs: 10
+  max_epochs: 400
   accelerator: gpu
   devices: 1
   precision: 32
   log_every_n_steps: 10
   default_root_dir: logs
-  gradient_clip_val: 0.1
+  gradient_clip_val: 5.0
   accumulate_grad_batches: 1
   enable_progress_bar: true
   val_check_interval: 100
@@ -76,6 +74,9 @@ trainer:
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar
       init_args:
         refresh_rate: 5
+    - class_path: hepattn.callbacks.GradientLoggerCallback
+      init_args:
+        log_every_n_steps: 10
 
 model:
   optimizer: AdamW
@@ -93,8 +94,11 @@ model:
   model:
     class_path: hepattn.models.MaskFormer
     init_args:
+      sorter:
+        class_path: hepattn.utils.sorter.Sorter
+        init_args:
+          input_sort_field: beamPOCA_z  # Sort tracks along beam direction
       dim: &dim 256
-      input_sort_field: beamPOCA_z
       target_object: vertex
 
       input_nets:
@@ -107,8 +111,8 @@ model:
                 fields:
                   - backward
                   - c00
-                  - c31
-                  - c33
+                  - c20
+                  - c22
                   - c55
                   - chi2
                 net:
@@ -132,12 +136,12 @@ model:
       encoder:
         class_path: hepattn.models.Encoder
         init_args:
-          num_layers: 6
+          num_layers: 3
           dim: *dim
           attn_type: torch
 
       decoder:
-        num_decoder_layers: 6
+        num_decoder_layers: 3
         num_queries: *max_vertices
         mask_attention: true
         use_query_masks: false
@@ -155,30 +159,56 @@ model:
         class_path: torch.nn.ModuleList
         init_args:
           modules:
-            - class_path: hepattn.models.task.ObjectValidTask
+            # Task 1: Vertex Classification (object_class_ce)
+            - class_path: hepattn.models.task.ObjectClassificationTask
               init_args:
-                name: pred_vertex_valid
+                name: vertex_classification
                 input_object: query
-                output_object: pred
+                output_object: vertex
                 target_object: vertex
+                num_classes: 2  # PV=0, SV=1, null=2
                 losses:
-                  object_bce: 1.0
+                  object_ce: 10.0 
                 costs:
-                  object_bce: 10.0
-                dim: *dim
-                null_weight: 1.0
+                  object_ce: 10.0
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: *dim
+                    output_size: 3  # num_classes + 1 (null)
+                null_weight: 0.5
                 mask_queries: false
+                has_intermediate_loss: true
 
+            # Task 2: Track-Vertex Assignment Mask (mask_ce + mask_dice)
             - class_path: hepattn.models.task.ObjectHitMaskTask
               init_args:
-                name: pred_track_assignment
+                name: track_assignment
                 input_constituent: tracks
                 input_object: query
-                output_object: pred
+                output_object: vertex
                 target_object: vertex
                 losses:
-                  mask_bce: 10.0
+                  mask_bce: 10.0    # equivalent to mask_ce
+                  mask_dice: 2.0    # dice loss
                 costs:
                   mask_bce: 10.0
+                  mask_dice: 2.0
                 dim: *dim
                 null_weight: 1.0
+                mask_attn: true
+                has_intermediate_loss: true
+
+            # Task 3: Vertex Position Regression
+            - class_path: hepattn.models.task.ObjectRegressionTask
+              init_args:
+                name: vertex_regression
+                input_object: query
+                output_object: vertex
+                target_object: vertex
+                fields: [ovtx_z, ovtx_t]
+                loss_weight: 2.0  # regression weight
+                cost_weight: 2.0
+                dim: *dim
+                loss: smooth_l1
+                has_intermediate_loss: true

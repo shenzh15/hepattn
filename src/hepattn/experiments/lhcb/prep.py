@@ -1,4 +1,9 @@
-"""Convert LHCb ROOT files to HDF5 format for ML training."""
+"""Convert LHCb ROOT files to HDF5 format for ML training.
+
+Example usage:
+    pixi run python src/hepattn/experiments/lhcb/prep.py -i data/lhcb/version3_small -o data/lhcb/version3_small_hdf5 --train_split 0.8
+    pixi run python src/hepattn/experiments/lhcb/prep.py -i data/lhcb/version3 -o data/lhcb/version3_hdf5 --train_split 0.8
+"""
 
 from pathlib import Path
 
@@ -35,17 +40,14 @@ def convert_root_to_hdf5(input_dir: str, output_dir: str, train_split: float = 0
         "beamPOCA_z",
         "beamPOCA_t",
         "backward",
-        "true_eta",
         "ovtx_x",
         "ovtx_y",
         "ovtx_z",
         "ovtx_t",
-        "tx_true",
-        "ty_true",
         "c00",
-        "c33",
+        "c20",
+        "c22",
         "c55",
-        "c31",
         "fromPV",
         "chi2",
         "event_number",

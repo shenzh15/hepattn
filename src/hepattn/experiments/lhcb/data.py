@@ -177,7 +177,13 @@ def collate_fn(batch, inputs_config, targets_config, max_vertices, scaler=None):
                 tensor = scaler.transforms[field].transform(tensor)
 
             if field == "is_pv":
-                targets["vertex_is_pv"] = tensor
+                # Store both the boolean version and class version
+                # targets["vertex_is_pv"] = tensor
+                # Convert to class labels for ObjectClassificationTask:
+                # PV (is_pv=True) -> class 0
+                # SV (is_pv=False) -> class 1
+                # Invalid vertices will be marked as null class (2) by the model
+                targets["vertex_class"] = (~tensor).long()  # True->0, False->1
             else:
                 targets[f"vertex_{field}"] = tensor
 
