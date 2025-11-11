@@ -109,7 +109,7 @@ class LHCbModel(ModelWrapper):
         target_classes = targets["vertex_class"]  # [B, N]
 
         # Get valid vertex mask to exclude padding
-        vertex_valid = targets.get("vertex_valid", None)
+        vertex_valid = targets.get("vertex_valid", None)  # padding mask [B, N_vertices]
 
         # Filter out padding vertices using the valid mask
         if vertex_valid is not None:

@@ -47,13 +47,13 @@ data:
       - 'is_pv'
 
 trainer:
-  max_epochs: 400
+  max_epochs: 50
   accelerator: gpu
   devices: 1
   precision: 32
   log_every_n_steps: 10
   default_root_dir: logs
-  gradient_clip_val: 5.0
+  gradient_clip_val: 1.0 
   accumulate_grad_batches: 1
   enable_progress_bar: true
   val_check_interval: 100
@@ -65,10 +65,21 @@ trainer:
 
   callbacks:
     - class_path: hepattn.callbacks.SaveConfig
+
+    # Checkpoint 1: Regular interval saves (every 1000 steps)
     - class_path: hepattn.callbacks.Checkpoint
       init_args:
         monitor: train/loss
         every_n_train_steps: 1000
+
+    # Checkpoint 2: Keep best checkpoints based on validation loss
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val/loss
+        save_top_k: 3  # Keep best 3 checkpoints
+        mode: min
+        filename: "best-epoch={epoch:03d}-val_loss={val/loss:.5f}"
+        dirpath: null  # Will be set by trainer to log_dir/checkpoints
     # - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar
@@ -82,12 +93,12 @@ model:
   optimizer: AdamW
 
   lrs_config:
-    initial: 1e-5
+    initial: 1e-7
     max: 5e-4
     end: 1e-5
-    pct_start: 0.01
+    pct_start: 0.05
     skip_scheduler: false
-    weight_decay: 1e-4
+    weight_decay: 1e-5
 
   mtl: false
 
@@ -168,9 +179,9 @@ model:
                 target_object: vertex
                 num_classes: 2  # PV=0, SV=1, null=2
                 losses:
-                  object_ce: 10.0 
+                  object_ce: 0.5
                 costs:
-                  object_ce: 10.0
+                  object_ce: 0.5
                 net:
                   class_path: hepattn.models.Dense
                   init_args:
@@ -190,10 +201,10 @@ model:
                 target_object: vertex
                 losses:
                   mask_bce: 10.0    # equivalent to mask_ce
-                  mask_dice: 2.0    # dice loss
+                  mask_dice: 8.0    # dice loss
                 costs:
                   mask_bce: 10.0
-                  mask_dice: 2.0
+                  mask_dice: 8.0
                 dim: *dim
                 null_weight: 1.0
                 mask_attn: true

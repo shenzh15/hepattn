@@ -1,6 +1,6 @@
 #+UseOS = "el9"
 +SingularityImage = "/data/bfys/shenzh/4Dtracking/hepattn/pixi.sif"
-+JobCategory = "short"
++JobCategory = "medium"
 request_gpus = 1
 request_cpus = 2
 request_memory = 16G
