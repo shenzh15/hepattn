@@ -1,6 +1,6 @@
 seed_everything: 42
 
-name: gradient_clip_val_5_baseline
+name: new_baseline_small_lr_10
 
 data:
   train_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version3_hdf5/train.h5
@@ -47,13 +47,13 @@ data:
       - 'is_pv'
 
 trainer:
-  max_epochs: 50
+  max_epochs: 100
   accelerator: gpu
   devices: 1
   precision: 32
   log_every_n_steps: 10
   default_root_dir: logs
-  gradient_clip_val: 1.0 
+  gradient_clip_val: 10.0
   accumulate_grad_batches: 1
   enable_progress_bar: true
   val_check_interval: 100
@@ -93,12 +93,12 @@ model:
   optimizer: AdamW
 
   lrs_config:
-    initial: 1e-7
-    max: 5e-4
-    end: 1e-5
+    initial: 1e-8
+    max: 5e-5
+    end: 1e-6
     pct_start: 0.05
     skip_scheduler: false
-    weight_decay: 1e-5
+    weight_decay: 1e-4
 
   mtl: false
 
