@@ -1,3 +1,4 @@
+import torch
 from lightning import Callback, LightningModule, Trainer
 
 
@@ -66,7 +67,11 @@ class GradientLoggerCallback(Callback):
                 )
 
     def _compute_single_loss_grad_norm(self, pl_module, loss_value):
-        """Compute gradient norm for a single loss component.
+        """Compute gradient norm for a single loss component using torch.autograd.grad.
+
+        This method uses torch.autograd.grad() instead of backward() to avoid
+        interfering with the training process. torch.autograd.grad() is purely
+        functional and does not modify the .grad attributes.
 
         Args:
             pl_module: Lightning module
@@ -75,17 +80,23 @@ class GradientLoggerCallback(Callback):
         Returns:
             float: L2 gradient norm
         """
-        # Zero gradients before computing
-        pl_module.zero_grad()
+        # Get all parameters that require gradients
+        params = [p for p in pl_module.parameters() if p.requires_grad]
 
-        # Backward pass for this specific loss
-        loss_value.backward(retain_graph=True)
+        # Compute gradients using torch.autograd.grad (no side effects)
+        grads = torch.autograd.grad(
+            loss_value,
+            params,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True
+        )
 
-        # Compute L2 gradient norm (same as Lightning's global norm)
+        # Compute L2 gradient norm
         grad_norm_squared = 0.0
-        for param in pl_module.parameters():
-            if param.grad is not None:
-                param_norm = param.grad.data.norm(2)
+        for grad in grads:
+            if grad is not None:
+                param_norm = grad.data.norm(2)
                 grad_norm_squared += param_norm.item() ** 2
 
         return grad_norm_squared ** 0.5
@@ -93,7 +104,10 @@ class GradientLoggerCallback(Callback):
     def compute_per_loss_gradients(self, trainer, pl_module, losses):
         """Compute and log gradient norms for each task (aggregated across all layers).
 
-        This method aggregates losses by task across all layers, then computes gradient norms.
+        This method aggregates losses by task across all layers, then computes gradient norms
+        using torch.autograd.grad() which does not modify parameter gradients and thus
+        does not interfere with the training process.
+
         For example, all vertex_classification losses from all layers are summed together.
 
         Args:
@@ -104,12 +118,6 @@ class GradientLoggerCallback(Callback):
         # Only log periodically to avoid overhead
         if trainer.global_step % self.log_every_n_steps != 0:
             return
-
-        # Store original gradients if they exist
-        original_grads = {}
-        for name, param in pl_module.named_parameters():
-            if param.grad is not None:
-                original_grads[name] = param.grad.clone()
 
         kwargs = {"sync_dist": len(trainer.device_ids) > 1, "on_step": True, "on_epoch": False}
 
@@ -142,9 +150,3 @@ class GradientLoggerCallback(Callback):
                 )
             except RuntimeError as e:
                 print(f"Warning: Could not compute gradient for task {task_name}: {e}")
-
-        # Restore original gradients
-        pl_module.zero_grad()
-        for name, param in pl_module.named_parameters():
-            if name in original_grads:
-                param.grad = original_grads[name]
