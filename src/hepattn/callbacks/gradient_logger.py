@@ -8,9 +8,9 @@ class GradientLoggerCallback(Callback):
 
         Args:
             log_every_n_steps (int): Frequency of logging gradients. Logs every `n` steps.
-            log_per_loss_grads (bool): If True, compute and log gradient norms for each loss component separately.
-                                       This helps diagnose which losses contribute most to gradient magnitude.
-                                       Warning: Adds computational overhead due to multiple backward passes.
+            log_per_loss_grads (bool): If True, compute and log gradient norms for each task separately.
+                                       This helps diagnose which tasks contribute most to gradient magnitude.
+                                       Uses torch.autograd.grad() which has minimal overhead.
         """
         self.log_every_n_steps = log_every_n_steps
         self.log_per_loss_grads = log_per_loss_grads
@@ -121,32 +121,49 @@ class GradientLoggerCallback(Callback):
 
         kwargs = {"sync_dist": len(trainer.device_ids) > 1, "on_step": True, "on_epoch": False}
 
-        # Aggregate losses by task across all layers
+        # Aggregate losses by task across all layers (for per-task gradients)
         task_aggregated_losses = {}
+        # Also aggregate by individual loss component (for per-loss gradients)
+        loss_component_aggregated = {}
+
         for layer_losses in losses.values():
             for task_name, task_losses in layer_losses.items():
+                # Aggregate by task
                 if task_name not in task_aggregated_losses:
                     task_aggregated_losses[task_name] = []
-
-                # Sum all losses for this task in this layer
                 layer_task_loss = sum(loss_value for loss_value in task_losses.values() if loss_value.requires_grad)
-                if layer_task_loss != 0:  # Only add non-zero losses
+                if layer_task_loss != 0:
                     task_aggregated_losses[task_name].append(layer_task_loss)
 
-        # Compute gradient norm for each aggregated task
+                # Aggregate by individual loss component
+                for loss_name, loss_value in task_losses.items():
+                    if not loss_value.requires_grad:
+                        continue
+                    component_key = f"{task_name}/{loss_name}"
+                    if component_key not in loss_component_aggregated:
+                        loss_component_aggregated[component_key] = []
+                    loss_component_aggregated[component_key].append(loss_value)
+
+        # 1. Compute and log gradient norm for each aggregated task
         for task_name, task_loss_list in task_aggregated_losses.items():
             if not task_loss_list:
                 continue
-
-            # Sum losses from all layers for this task
             total_task_loss = sum(task_loss_list)
-
             try:
                 grad_norm = self._compute_single_loss_grad_norm(pl_module, total_task_loss)
-                pl_module.log(
-                    f"per_task_grad_norm/{task_name}",
-                    grad_norm,
-                    **kwargs
-                )
+                pl_module.log(f"per_task_grad_norm/{task_name}", grad_norm, **kwargs)
             except RuntimeError as e:
                 print(f"Warning: Could not compute gradient for task {task_name}: {e}")
+
+        # 2. Compute and log gradient norm for each individual loss component
+        for component_key, loss_list in loss_component_aggregated.items():
+            if not loss_list:
+                continue
+            total_component_loss = sum(loss_list)
+            try:
+                grad_norm = self._compute_single_loss_grad_norm(pl_module, total_component_loss)
+                pl_module.log(f"per_loss_grad_norm/{component_key}", grad_norm, **kwargs)
+                # Also log the weighted loss value for reference
+                pl_module.log(f"weighted_loss_value/{component_key}", total_component_loss.item(), **kwargs)
+            except RuntimeError as e:
+                print(f"Warning: Could not compute gradient for component {component_key}: {e}")
