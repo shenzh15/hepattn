@@ -85,6 +85,12 @@ class ModelWrapper(LightningModule):
         losses, targets = self.model.loss(outputs, targets)
         total_loss = self.log_losses(losses, "train")
 
+        # Compute per-loss gradient norms if requested (via GradientLoggerCallback)
+        for callback in self.trainer.callbacks:
+            if hasattr(callback, "compute_per_loss_gradients") and getattr(callback, "log_per_loss_grads", False):
+                callback.compute_per_loss_gradients(self.trainer, self, losses)
+                break  # Only call once if multiple gradient loggers exist
+
         # Get the predictions from the model
         if batch_idx % self.trainer.log_every_n_steps == 0:  # avoid calling predict if possible
             preds = self.predict(outputs)
