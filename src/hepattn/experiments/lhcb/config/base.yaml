@@ -1,14 +1,14 @@
 seed_everything: 42
 
-name: new_baseline_small_lr_10
+name: new_baseline_small_lr5e-4_clip10_all_metrics
 
 data:
-  train_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version3_hdf5/train.h5
-  val_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version3_hdf5/val.h5
+  train_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version5_hdf5/train.h5
+  val_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version5_hdf5/val.h5
   test_path: null  # Optional, only needed for testing
 
   # DataLoader parameters
-  batch_size: 64
+  batch_size: 32
   num_workers: 2
   pin_memory: true
 
@@ -21,7 +21,7 @@ data:
   max_vertices: &max_vertices 100
 
   # Path to variable transformation/scaling configuration
-  scale_dict_path: /data/bfys/shenzh/4Dtracking/hepattn/src/hepattn/experiments/lhcb/config/lhcb_var_transform.yaml
+  scale_dict_path: /data/bfys/shenzh/4Dtracking/hepattn/src/hepattn/experiments/lhcb/config/lhcb_var_transform5.yaml
 
   # Input features (all track features including beamPOCA)
   inputs:
@@ -78,8 +78,8 @@ trainer:
         monitor: val/loss
         save_top_k: 3  # Keep best 3 checkpoints
         mode: min
-        filename: "best-epoch={epoch:03d}-val_loss={val/loss:.5f}"
-        dirpath: null  # Will be set by trainer to log_dir/checkpoints
+        filename: "best-{epoch:03d}-val_loss={loss:.5f}"
+        dirpath: ckpts  # Save to same directory as training checkpoints
     # - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar
@@ -95,7 +95,7 @@ model:
 
   lrs_config:
     initial: 1e-8
-    max: 5e-5
+    max: 5e-4
     end: 1e-6
     pct_start: 0.05
     skip_scheduler: false

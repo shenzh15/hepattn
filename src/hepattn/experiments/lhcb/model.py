@@ -20,21 +20,25 @@ class LHCbModel(ModelWrapper):
     ):
         super().__init__(name, model, lrs_config, optimizer, mtl)
 
-        # ============ PV/SV/Null Classification Metrics ============
-        # Class definition: 0=PV (Primary Vertex), 1=SV (Secondary Vertex), 2=Null
-        num_classes = 3
-
-        # Overall classification metrics
-        self.vertex_acc_micro = tm.classification.MulticlassAccuracy(num_classes=num_classes, average="micro")
-        self.vertex_acc_macro = tm.classification.MulticlassAccuracy(num_classes=num_classes, average="macro")
-
-        # Per-class detailed metrics
-        self.per_class_precision = tm.classification.MulticlassPrecision(num_classes=num_classes, average=None)
-        self.per_class_recall = tm.classification.MulticlassRecall(num_classes=num_classes, average=None)
-
+        # ======== PV/SV Classification Metrics ========
         # Efficiency metrics for PV and SV (based on track overlap matching)
         self.pv_efficiency = tm.MeanMetric()
         self.sv_efficiency = tm.MeanMetric()
+
+        # Strict PV efficiency: requires predicted vertex to be classified as PV
+        self.pv_efficiency_strict = tm.MeanMetric()
+
+        # Fake rate metrics for PV reconstruction
+        self.pv_fake_rate_strict = tm.MeanMetric()  # Only pred PVs can match true PVs
+        self.pv_fake_rate_relaxed = tm.MeanMetric()  # Any pred vertex can match true PVs
+
+        # Split rate metrics for PV reconstruction (true PV matched by >= 2 pred vertices)
+        self.pv_split_rate_strict = tm.MeanMetric()  # Only pred PVs can match
+        self.pv_split_rate_relaxed = tm.MeanMetric()  # Any pred vertex can match
+
+        # Merge rate metrics for PV reconstruction (true PV claimed by >= 2 pred vertices with high purity)
+        self.pv_merge_rate_strict = tm.MeanMetric()  # Only pred PVs can claim
+        self.pv_merge_rate_relaxed = tm.MeanMetric()  # Any pred vertex can claim
 
     def compute_track_overlap_matching(
         self,
@@ -83,6 +87,359 @@ class LHCbModel(ModelWrapper):
         # Mask out invalid vertices and return
         return matched & vertex_valid
 
+    def compute_fake_rate_strict(
+        self,
+        pred_tracks_mask: torch.Tensor,
+        true_tracks_mask: torch.Tensor,
+        pred_classes: torch.Tensor,
+        true_classes: torch.Tensor,
+        vertex_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute strict fake rate for reconstructed PVs using pure matrix operations.
+
+        Only predicted vertices classified as PV can match true PVs.
+
+        For each true PV, the reconstructed PV with maximum recall is matched.
+        After all true PVs are matched, the remaining unmatched reconstructed PVs are considered fake.
+        Fake rate = number of fake PVs / total number of reconstructed PVs
+
+        Args:
+            pred_tracks_mask: Predicted track-vertex assignment [B, N_pred, N_tracks]
+            true_tracks_mask: Ground truth track-vertex assignment [B, N_true, N_tracks]
+            pred_classes: Predicted vertex classes [B, N_pred]
+            true_classes: Ground truth vertex classes [B, N_true]
+            vertex_valid: Valid vertex mask [B, N_true]
+
+        Returns:
+            fake_rate: Fake rate for each batch element [B]
+        """
+        # Step 1: Identify PV vertices (class 0)
+        pred_is_pv = pred_classes == 0  # [B, N_pred]
+        true_is_pv = (true_classes == 0) & vertex_valid  # [B, N_true]
+
+        # Step 2: Compute overlap matrix for all vertices using batch matrix multiplication
+        # [B, N_pred, N_tracks] @ [B, N_tracks, N_true] -> [B, N_pred, N_true]
+        overlap = torch.bmm(pred_tracks_mask.float(), true_tracks_mask.transpose(1, 2).float())
+
+        # Step 3: Compute recall matrix
+        n_true_tracks = true_tracks_mask.sum(dim=2)  # [B, N_true]
+        recall = overlap / (n_true_tracks.unsqueeze(1) + 1e-8)  # [B, N_pred, N_true]
+
+        # Step 4: Mask out non-PV vertices by setting their recall to -1
+        # This ensures they won't be selected when finding maximum recall (recall range is [0,1])
+        recall_masked = recall.clone()
+        # Mask predicted non-PVs: set entire row to -1
+        recall_masked[~pred_is_pv] = -1.0
+        # Mask true non-PVs: set entire column to -1
+        recall_masked = torch.where(true_is_pv.unsqueeze(1), recall_masked, -1.0)
+
+        # Step 5: For each true PV, find the predicted vertex with maximum recall
+        # max_values: [B, N_true], max_indices: [B, N_true]
+        max_recall_values, max_recall_pred_idx = recall_masked.max(dim=1)
+
+        # Step 6: Create matched mask for predicted PVs
+        # We need to mark which predicted PVs were selected by any true PV
+        b, n_pred, n_true = recall_masked.shape
+
+        # Create batch indices for advanced indexing
+        batch_idx = torch.arange(b, device=recall.device).unsqueeze(1).expand(b, n_true)  # [B, N_true]
+
+        # Initialize matched mask
+        matched_pred_pvs = torch.zeros(b, n_pred, dtype=torch.bool, device=recall.device)
+
+        # Only mark matches where the true vertex is actually a PV and max recall is valid
+        valid_matches = true_is_pv & (max_recall_values > -1.0)  # [B, N_true]
+
+        # Use advanced indexing to mark matched predicted vertices
+        # For each valid true PV, mark its best matching predicted vertex as matched
+        if valid_matches.any():
+            matched_pred_pvs[batch_idx[valid_matches], max_recall_pred_idx[valid_matches]] = True
+
+        # Step 7: Compute fake rate per batch element
+        # Count predicted PVs
+        n_pred_pv = pred_is_pv.sum(dim=1).float()  # [B]
+
+        # Count fake PVs: predicted PVs that were not matched
+        n_fake = (pred_is_pv & ~matched_pred_pvs).sum(dim=1).float()  # [B]
+
+        # Compute fake rate, handling edge cases
+        return torch.where(n_pred_pv > 0, n_fake / n_pred_pv, torch.zeros_like(n_pred_pv))
+
+    def compute_fake_rate_relaxed(
+        self,
+        pred_tracks_mask: torch.Tensor,
+        true_tracks_mask: torch.Tensor,
+        pred_classes: torch.Tensor,
+        true_classes: torch.Tensor,
+        vertex_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute relaxed fake rate for reconstructed PVs using pure matrix operations.
+
+        Does NOT use PV/SV classification for matching - any predicted vertex can match true PVs.
+        This measures how many predicted PVs are fake when ignoring classification predictions.
+
+        For each true PV, ANY predicted vertex with maximum recall is matched (ignoring class).
+        After all true PVs are matched, we count how many predicted PVs were not matched.
+        Fake rate = number of unmatched predicted PVs / total number of predicted PVs
+
+        Args:
+            pred_tracks_mask: Predicted track-vertex assignment [B, N_pred, N_tracks]
+            true_tracks_mask: Ground truth track-vertex assignment [B, N_true, N_tracks]
+            pred_classes: Predicted vertex classes [B, N_pred]
+            true_classes: Ground truth vertex classes [B, N_true]
+            vertex_valid: Valid vertex mask [B, N_true]
+
+        Returns:
+            fake_rate: Fake rate for each batch element [B]
+        """
+        # Step 1: Identify true PV vertices (pred classification not used in relaxed version)
+        true_is_pv = (true_classes == 0) & vertex_valid  # [B, N_true]
+
+        # Step 2: Compute overlap matrix for ALL vertices (no pred classification filtering)
+        overlap = torch.bmm(pred_tracks_mask.float(), true_tracks_mask.transpose(1, 2).float())
+
+        # Step 3: Compute recall matrix
+        n_true_tracks = true_tracks_mask.sum(dim=2)  # [B, N_true]
+        recall = overlap / (n_true_tracks.unsqueeze(1) + 1e-8)  # [B, N_pred, N_true]
+
+        # Step 4: Only mask out true non-PVs (do NOT filter predicted vertices by class)
+        recall_masked = torch.where(true_is_pv.unsqueeze(1), recall, -1.0)
+
+        # Step 5: For each true PV, find ANY predicted vertex with maximum recall
+        max_recall_values, max_recall_pred_idx = recall_masked.max(dim=1)
+
+        # Step 6: Create matched mask for ALL predicted vertices
+        b, n_pred, n_true = recall_masked.shape
+        batch_idx = torch.arange(b, device=recall.device).unsqueeze(1).expand(b, n_true)
+        matched_pred_vertices = torch.zeros(b, n_pred, dtype=torch.bool, device=recall.device)
+
+        # Mark matched vertices (any vertex can be matched, regardless of classification)
+        valid_matches = true_is_pv & (max_recall_values > -1.0)
+        if valid_matches.any():
+            matched_pred_vertices[batch_idx[valid_matches], max_recall_pred_idx[valid_matches]] = True
+
+        # Step 7: Compute fake rate among ALL predicted vertices (ignoring classification)
+        # Count all predicted vertices
+        n_pred_total = torch.ones_like(matched_pred_vertices, dtype=torch.float).sum(dim=1)  # [B]
+        # Count all vertices that were not matched
+        n_fake = (~matched_pred_vertices).sum(dim=1).float()  # [B]
+
+        return torch.where(n_pred_total > 0, n_fake / n_pred_total, torch.zeros_like(n_pred_total))
+
+    def compute_split_rate_strict(
+        self,
+        pred_tracks_mask: torch.Tensor,
+        true_tracks_mask: torch.Tensor,
+        pred_classes: torch.Tensor,
+        true_classes: torch.Tensor,
+        vertex_valid: torch.Tensor,
+        recall_threshold: float = 0.7,
+    ) -> torch.Tensor:
+        """Compute strict split rate for true PVs using pure matrix operations.
+
+        Only predicted vertices classified as PV can contribute to splitting.
+        A true PV is considered "split" if at least 2 predicted PVs have recall >= threshold.
+
+        Split rate = number of split true PVs / total number of true PVs
+
+        Args:
+            pred_tracks_mask: Predicted track-vertex assignment [B, N_pred, N_tracks]
+            true_tracks_mask: Ground truth track-vertex assignment [B, N_true, N_tracks]
+            pred_classes: Predicted vertex classes [B, N_pred]
+            true_classes: Ground truth vertex classes [B, N_true]
+            vertex_valid: Valid vertex mask [B, N_true]
+            recall_threshold: Minimum recall to count as a match (default: 0.7)
+
+        Returns:
+            split_rate: Split rate for each batch element [B]
+        """
+        # Step 1: Identify PV vertices
+        pred_is_pv = pred_classes == 0  # [B, N_pred]
+        true_is_pv = (true_classes == 0) & vertex_valid  # [B, N_true]
+
+        # Step 2: Compute overlap and recall matrices
+        overlap = torch.bmm(pred_tracks_mask.float(), true_tracks_mask.transpose(1, 2).float())
+        n_true_tracks = true_tracks_mask.sum(dim=2)  # [B, N_true]
+        recall = overlap / (n_true_tracks.unsqueeze(1) + 1e-8)  # [B, N_pred, N_true]
+
+        # Step 3: Filter recall by predicted PV classification
+        recall_filtered = recall.clone()
+        recall_filtered[~pred_is_pv] = 0.0  # Only pred PVs can contribute
+
+        # Step 4: Find matches with recall >= threshold
+        high_recall_matches = (recall_filtered >= recall_threshold).float()  # [B, N_pred, N_true]
+
+        # Step 5: Count how many pred vertices match each true PV
+        n_matches_per_true = high_recall_matches.sum(dim=1)  # [B, N_true]
+
+        # Step 6: Identify split true PVs (>= 2 matches)
+        is_split = (n_matches_per_true >= 2) & true_is_pv  # [B, N_true]
+
+        # Step 7: Compute split rate
+        n_true_pv = true_is_pv.sum(dim=1).float()  # [B]
+        n_split = is_split.sum(dim=1).float()  # [B]
+
+        return torch.where(n_true_pv > 0, n_split / n_true_pv, torch.zeros_like(n_true_pv))
+
+    def compute_split_rate_relaxed(
+        self,
+        pred_tracks_mask: torch.Tensor,
+        true_tracks_mask: torch.Tensor,
+        pred_classes: torch.Tensor,
+        true_classes: torch.Tensor,
+        vertex_valid: torch.Tensor,
+        recall_threshold: float = 0.7,
+    ) -> torch.Tensor:
+        """Compute relaxed split rate for true PVs using pure matrix operations.
+
+        Any predicted vertex (regardless of classification) can contribute to splitting.
+        A true PV is considered "split" if at least 2 predicted vertices have recall >= threshold.
+
+        Split rate = number of split true PVs / total number of true PVs
+
+        Args:
+            pred_tracks_mask: Predicted track-vertex assignment [B, N_pred, N_tracks]
+            true_tracks_mask: Ground truth track-vertex assignment [B, N_true, N_tracks]
+            pred_classes: Predicted vertex classes [B, N_pred]
+            true_classes: Ground truth vertex classes [B, N_true]
+            vertex_valid: Valid vertex mask [B, N_true]
+            recall_threshold: Minimum recall to count as a match (default: 0.7)
+
+        Returns:
+            split_rate: Split rate for each batch element [B]
+        """
+        # Step 1: Identify true PV vertices only
+        true_is_pv = (true_classes == 0) & vertex_valid  # [B, N_true]
+
+        # Step 2: Compute overlap and recall matrices for ALL pred vertices
+        overlap = torch.bmm(pred_tracks_mask.float(), true_tracks_mask.transpose(1, 2).float())
+        n_true_tracks = true_tracks_mask.sum(dim=2)  # [B, N_true]
+        recall = overlap / (n_true_tracks.unsqueeze(1) + 1e-8)  # [B, N_pred, N_true]
+
+        # Step 3: Find matches with recall >= threshold (no pred filtering)
+        high_recall_matches = (recall >= recall_threshold).float()  # [B, N_pred, N_true]
+
+        # Step 4: Count how many pred vertices match each true PV
+        n_matches_per_true = high_recall_matches.sum(dim=1)  # [B, N_true]
+
+        # Step 5: Identify split true PVs (>= 2 matches)
+        is_split = (n_matches_per_true >= 2) & true_is_pv  # [B, N_true]
+
+        # Step 6: Compute split rate
+        n_true_pv = true_is_pv.sum(dim=1).float()  # [B]
+        n_split = is_split.sum(dim=1).float()  # [B]
+
+        return torch.where(n_true_pv > 0, n_split / n_true_pv, torch.zeros_like(n_true_pv))
+
+    def compute_merge_rate_strict(
+        self,
+        pred_tracks_mask: torch.Tensor,
+        true_tracks_mask: torch.Tensor,
+        pred_classes: torch.Tensor,
+        true_classes: torch.Tensor,
+        vertex_valid: torch.Tensor,
+        purity_threshold: float = 0.7,
+    ) -> torch.Tensor:
+        """Compute strict merge rate for true PVs using pure matrix operations.
+
+        Only predicted vertices classified as PV can contribute to merging.
+        A true PV is considered "merged" if at least 2 predicted PVs have purity >= threshold.
+
+        Purity (precision) = overlap / n_pred_tracks (measures how much of pred vertex is correct)
+
+        Merge rate = number of merged true PVs / total number of true PVs
+
+        Args:
+            pred_tracks_mask: Predicted track-vertex assignment [B, N_pred, N_tracks]
+            true_tracks_mask: Ground truth track-vertex assignment [B, N_true, N_tracks]
+            pred_classes: Predicted vertex classes [B, N_pred]
+            true_classes: Ground truth vertex classes [B, N_true]
+            vertex_valid: Valid vertex mask [B, N_true]
+            purity_threshold: Minimum purity to count as a match (default: 0.7)
+
+        Returns:
+            merge_rate: Merge rate for each batch element [B]
+        """
+        # Step 1: Identify PV vertices
+        pred_is_pv = pred_classes == 0  # [B, N_pred]
+        true_is_pv = (true_classes == 0) & vertex_valid  # [B, N_true]
+
+        # Step 2: Compute overlap and purity (precision) matrices
+        overlap = torch.bmm(pred_tracks_mask.float(), true_tracks_mask.transpose(1, 2).float())
+        n_pred_tracks = pred_tracks_mask.sum(dim=2)  # [B, N_pred]
+        purity = overlap / (n_pred_tracks.unsqueeze(2) + 1e-8)  # [B, N_pred, N_true]
+
+        # Step 3: Filter purity by predicted PV classification
+        purity_filtered = purity.clone()
+        purity_filtered[~pred_is_pv] = 0.0  # Only pred PVs can contribute
+
+        # Step 4: Find matches with purity >= threshold
+        high_purity_matches = (purity_filtered >= purity_threshold).float()  # [B, N_pred, N_true]
+
+        # Step 5: Count how many pred vertices match each true PV
+        n_matches_per_true = high_purity_matches.sum(dim=1)  # [B, N_true]
+
+        # Step 6: Identify merged true PVs (>= 2 matches)
+        is_merged = (n_matches_per_true >= 2) & true_is_pv  # [B, N_true]
+
+        # Step 7: Compute merge rate
+        n_true_pv = true_is_pv.sum(dim=1).float()  # [B]
+        n_merged = is_merged.sum(dim=1).float()  # [B]
+
+        return torch.where(n_true_pv > 0, n_merged / n_true_pv, torch.zeros_like(n_true_pv))
+
+    def compute_merge_rate_relaxed(
+        self,
+        pred_tracks_mask: torch.Tensor,
+        true_tracks_mask: torch.Tensor,
+        pred_classes: torch.Tensor,
+        true_classes: torch.Tensor,
+        vertex_valid: torch.Tensor,
+        purity_threshold: float = 0.7,
+    ) -> torch.Tensor:
+        """Compute relaxed merge rate for true PVs using pure matrix operations.
+
+        Any predicted vertex (regardless of classification) can contribute to merging.
+        A true PV is considered "merged" if at least 2 predicted vertices have purity >= threshold.
+
+        Purity (precision) = overlap / n_pred_tracks (measures how much of pred vertex is correct)
+
+        Merge rate = number of merged true PVs / total number of true PVs
+
+        Args:
+            pred_tracks_mask: Predicted track-vertex assignment [B, N_pred, N_tracks]
+            true_tracks_mask: Ground truth track-vertex assignment [B, N_true, N_tracks]
+            pred_classes: Predicted vertex classes [B, N_pred]
+            true_classes: Ground truth vertex classes [B, N_true]
+            vertex_valid: Valid vertex mask [B, N_true]
+            purity_threshold: Minimum purity to count as a match (default: 0.7)
+
+        Returns:
+            merge_rate: Merge rate for each batch element [B]
+        """
+        # Step 1: Identify true PV vertices only
+        true_is_pv = (true_classes == 0) & vertex_valid  # [B, N_true]
+
+        # Step 2: Compute overlap and purity (precision) matrices for ALL pred vertices
+        overlap = torch.bmm(pred_tracks_mask.float(), true_tracks_mask.transpose(1, 2).float())
+        n_pred_tracks = pred_tracks_mask.sum(dim=2)  # [B, N_pred]
+        purity = overlap / (n_pred_tracks.unsqueeze(2) + 1e-8)  # [B, N_pred, N_true]
+
+        # Step 3: Find matches with purity >= threshold (no pred filtering)
+        high_purity_matches = (purity >= purity_threshold).float()  # [B, N_pred, N_true]
+
+        # Step 4: Count how many pred vertices match each true PV
+        n_matches_per_true = high_purity_matches.sum(dim=1)  # [B, N_true]
+
+        # Step 5: Identify merged true PVs (>= 2 matches)
+        is_merged = (n_matches_per_true >= 2) & true_is_pv  # [B, N_true]
+
+        # Step 6: Compute merge rate
+        n_true_pv = true_is_pv.sum(dim=1).float()  # [B]
+        n_merged = is_merged.sum(dim=1).float()  # [B]
+
+        return torch.where(n_true_pv > 0, n_merged / n_true_pv, torch.zeros_like(n_true_pv))
+
     def log_custom_metrics(self, preds, targets, stage):
         """Log custom metrics for vertex reconstruction.
 
@@ -110,30 +467,6 @@ class LHCbModel(ModelWrapper):
 
         # Get valid vertex mask to exclude padding
         vertex_valid = targets.get("vertex_valid", None)  # padding mask [B, N_vertices]
-
-        # Filter out padding vertices using the valid mask
-        if vertex_valid is not None:
-            pred_flat = pred_classes[vertex_valid]
-            target_flat = target_classes[vertex_valid]
-        else:
-            pred_flat = pred_classes.view(-1)
-            target_flat = target_classes.view(-1)
-
-        # ======== Overall Classification Metrics ========
-        self.vertex_acc_micro(pred_flat, target_flat)
-        self.log(f"{stage}/vertex_acc_micro", self.vertex_acc_micro, sync_dist=True)
-
-        self.vertex_acc_macro(pred_flat, target_flat)
-        self.log(f"{stage}/vertex_acc_macro", self.vertex_acc_macro, sync_dist=True)
-
-        # ======== Per-class Detailed Metrics ========
-        per_class_prec = self.per_class_precision(pred_flat, target_flat)
-        per_class_rec = self.per_class_recall(pred_flat, target_flat)
-
-        class_names = ["pv", "sv"]
-        for i, class_name in enumerate(class_names):
-            self.log(f"{stage}/{class_name}_precision", per_class_prec[i], sync_dist=True)
-            self.log(f"{stage}/{class_name}_recall", per_class_rec[i], sync_dist=True)
 
         # ======== Track Overlap-based Efficiency Metrics ========
         # Get predicted and ground truth track-vertex assignments
@@ -175,9 +508,113 @@ class LHCbModel(ModelWrapper):
             self.pv_efficiency(pv_eff)
             self.log(f"{stage}/pv_efficiency", self.pv_efficiency, sync_dist=True)
 
+        # ======== Strict PV Efficiency (pred must be classified as PV) ========
+        # Recompute match quality, but only consider pred vertices classified as PV
+        overlap = torch.bmm(pred_assignment.float(), true_assignment.transpose(1, 2).float())
+        n_true_tracks = true_assignment.sum(dim=2)
+        n_pred_tracks = pred_assignment.sum(dim=2)
+        recall = overlap / (n_true_tracks.unsqueeze(1) + 1e-8)
+        precision = overlap / (n_pred_tracks.unsqueeze(2) + 1e-8)
+
+        # Match quality matrix
+        match_quality = (recall >= 0.7) & (precision >= 0.7)  # [B, N_pred, N_true]
+
+        # Only consider matches where predicted vertex is classified as PV
+        pred_is_pv_mask = pred_classes == 0  # [B, N_pred]
+        match_quality_strict = match_quality & pred_is_pv_mask.unsqueeze(2)  # [B, N_pred, N_true]
+
+        # Check if any pred PV matches each true vertex
+        matched_strict = match_quality_strict.any(dim=1) & vertex_valid  # [B, N_true]
+
+        # Compute strict efficiency for PV
+        if pv_mask.any():
+            pv_matched_strict = matched_strict[pv_mask]
+            pv_eff_strict = pv_matched_strict.float().mean()
+            self.pv_efficiency_strict(pv_eff_strict)
+            self.log(f"{stage}/pv_efficiency_strict", self.pv_efficiency_strict, sync_dist=True)
+
         # Compute efficiency for SV
         if sv_mask.any():
             sv_matched = matched[sv_mask]
             sv_eff = sv_matched.float().mean()
             self.sv_efficiency(sv_eff)
             self.log(f"{stage}/sv_efficiency", self.sv_efficiency, sync_dist=True)
+
+        # ======== Fake Rate for PV ========
+        # Strict: Only pred PVs can match true PVs
+        fake_rates_strict = self.compute_fake_rate_strict(
+            pred_tracks_mask=pred_assignment,
+            true_tracks_mask=true_assignment,
+            pred_classes=pred_classes,
+            true_classes=target_classes,
+            vertex_valid=vertex_valid,
+        )
+        mean_fake_rate_strict = fake_rates_strict.mean()
+        self.pv_fake_rate_strict(mean_fake_rate_strict)
+        self.log(f"{stage}/pv_fake_rate_strict", self.pv_fake_rate_strict, sync_dist=True)
+
+        # Relaxed: Any pred vertex can match true PVs (ignores classification)
+        fake_rates_relaxed = self.compute_fake_rate_relaxed(
+            pred_tracks_mask=pred_assignment,
+            true_tracks_mask=true_assignment,
+            pred_classes=pred_classes,
+            true_classes=target_classes,
+            vertex_valid=vertex_valid,
+        )
+        mean_fake_rate_relaxed = fake_rates_relaxed.mean()
+        self.pv_fake_rate_relaxed(mean_fake_rate_relaxed)
+        self.log(f"{stage}/pv_fake_rate_relaxed", self.pv_fake_rate_relaxed, sync_dist=True)
+
+        # ======== Split Rate for PV ========
+        # Strict: Only pred PVs can contribute to splitting
+        split_rates_strict = self.compute_split_rate_strict(
+            pred_tracks_mask=pred_assignment,
+            true_tracks_mask=true_assignment,
+            pred_classes=pred_classes,
+            true_classes=target_classes,
+            vertex_valid=vertex_valid,
+            recall_threshold=0.7,
+        )
+        mean_split_rate_strict = split_rates_strict.mean()
+        self.pv_split_rate_strict(mean_split_rate_strict)
+        self.log(f"{stage}/pv_split_rate_strict", self.pv_split_rate_strict, sync_dist=True)
+
+        # Relaxed: Any pred vertex can contribute to splitting (ignores classification)
+        split_rates_relaxed = self.compute_split_rate_relaxed(
+            pred_tracks_mask=pred_assignment,
+            true_tracks_mask=true_assignment,
+            pred_classes=pred_classes,
+            true_classes=target_classes,
+            vertex_valid=vertex_valid,
+            recall_threshold=0.7,
+        )
+        mean_split_rate_relaxed = split_rates_relaxed.mean()
+        self.pv_split_rate_relaxed(mean_split_rate_relaxed)
+        self.log(f"{stage}/pv_split_rate_relaxed", self.pv_split_rate_relaxed, sync_dist=True)
+
+        # ======== Merge Rate for PV ========
+        # Strict: Only pred PVs can contribute to merging
+        merge_rates_strict = self.compute_merge_rate_strict(
+            pred_tracks_mask=pred_assignment,
+            true_tracks_mask=true_assignment,
+            pred_classes=pred_classes,
+            true_classes=target_classes,
+            vertex_valid=vertex_valid,
+            purity_threshold=0.7,
+        )
+        mean_merge_rate_strict = merge_rates_strict.mean()
+        self.pv_merge_rate_strict(mean_merge_rate_strict)
+        self.log(f"{stage}/pv_merge_rate_strict", self.pv_merge_rate_strict, sync_dist=True)
+
+        # Relaxed: Any pred vertex can contribute to merging (ignores classification)
+        merge_rates_relaxed = self.compute_merge_rate_relaxed(
+            pred_tracks_mask=pred_assignment,
+            true_tracks_mask=true_assignment,
+            pred_classes=pred_classes,
+            true_classes=target_classes,
+            vertex_valid=vertex_valid,
+            purity_threshold=0.7,
+        )
+        mean_merge_rate_relaxed = merge_rates_relaxed.mean()
+        self.pv_merge_rate_relaxed(mean_merge_rate_relaxed)
+        self.log(f"{stage}/pv_merge_rate_relaxed", self.pv_merge_rate_relaxed, sync_dist=True)
