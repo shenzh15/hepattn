@@ -69,18 +69,10 @@ trainer:
     # Checkpoint 1: Regular interval saves (every 1000 steps)
     - class_path: hepattn.callbacks.Checkpoint
       init_args:
-        monitor: train/loss
-        every_n_train_steps: 1000
-
-    # Checkpoint 2: Keep best checkpoints based on validation loss
-    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
-      init_args:
         monitor: val/loss
-        save_top_k: 3  # Keep best 3 checkpoints
-        mode: min
-        filename: "best-{epoch:03d}-val_loss={loss:.5f}"
-        dirpath: ckpts  # Save to same directory as training checkpoints
-    # - class_path: lightning.pytorch.callbacks.ModelSummary
+        save_last: true
+
+    - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar
       init_args:
