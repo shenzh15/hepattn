@@ -23,6 +23,7 @@ class LHCbDataset(Dataset):
         super().__init__()
 
         self.filepath = Path(filepath)
+        self.dirpath = self.filepath.parent  # Add dirpath for PredictionWriter compatibility
         self.inputs = inputs
         self.targets = targets
         self.max_vertices = max_vertices
@@ -76,6 +77,7 @@ class LHCbDataset(Dataset):
             "tracks": tracks,
             "vertices": vertices,
             "vertex_tracks_valid": vertex_tracks_valid,
+            "event_idx": event_idx,  # Add event index for PredictionWriter
         }
 
     def load_event(self, idx):
@@ -209,6 +211,10 @@ def collate_fn(batch, inputs_config, targets_config, max_vertices, scaler=None):
 
     # Provide as vertex_tracks_valid for ObjectHitMaskTask
     targets["vertex_tracks_valid"] = torch.from_numpy(assignment_mask)
+
+    # Add sample_id for PredictionWriter
+    sample_ids = torch.tensor([sample["event_idx"] for sample in batch], dtype=torch.long)
+    targets["sample_id"] = sample_ids
 
     return inputs, targets
 

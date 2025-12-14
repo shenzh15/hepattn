@@ -157,36 +157,20 @@ def convert_root_to_hdf5(input_dir: str, output_dir: str, train_split: float = 0
     n_tracks_before = len(event_numbers)
     print(f"  Tracks before cuts: {n_tracks_before}")
 
-    # Cut 1: zbl_err < 1
-    zbl_err = calc_zbl_err(
-        all_data["beamPOCA_tx"],
-        all_data["beamPOCA_ty"],
-        all_data["c00"],
-    )
-    zbl_err_mask = zbl_err < 1.0
-    n_zbl_err = np.sum(zbl_err_mask)
-    print(f"  After zbl_err < 1: {n_zbl_err} tracks ({n_zbl_err / n_tracks_before * 100:.2f}%)")
+    # Cut 1: c00 < 1
+    c00 = all_data["c00"]
+    c00_mask = c00 < 0.2
+    n_c00 = np.sum(c00_mask)
+    print(f"  After c00 < 0.2: {n_c00} tracks ({n_c00 / n_tracks_before * 100:.2f}%)")
 
-    # Cut 2: z range [-200, 200] mm
-    z = all_data["beamPOCA_z"]
-    z_mask = (z >= -200.0) & (z <= 200.0)
-    n_z = np.sum(z_mask)
-    print(f"  After -200 < z < 200: {n_z} tracks ({n_z / n_tracks_before * 100:.2f}%)")
-
-    # Cut 3: t range [-0.6, 0.8]
-    t = all_data["beamPOCA_t"]
-    t_mask = (t >= -0.6) & (t <= 0.8)
-    n_t = np.sum(t_mask)
-    print(f"  After -0.6 < t < 0.8: {n_t} tracks ({n_t / n_tracks_before * 100:.2f}%)")
-
-    # Cut 4: chi2 < 5
+    # Cut 2: chi2 < 100
     chi2 = all_data["chi2"]
-    chi2_mask = chi2 < 5.0
+    chi2_mask = chi2 < 100.0
     n_chi2 = np.sum(chi2_mask)
-    print(f"  After chi2 < 5: {n_chi2} tracks ({n_chi2 / n_tracks_before * 100:.2f}%)")
+    print(f"  After chi2 < 100: {n_chi2} tracks ({n_chi2 / n_tracks_before * 100:.2f}%)")
 
     # Combined quality mask (all cuts must pass)
-    quality_mask = zbl_err_mask & z_mask & t_mask & chi2_mask
+    quality_mask = c00_mask & chi2_mask
 
     # Apply mask to all data
     for branch in branches_to_read:

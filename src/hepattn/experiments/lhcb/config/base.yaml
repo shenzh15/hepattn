@@ -3,10 +3,10 @@ seed_everything: 42
 name: new_baseline_small_lr5e-4_clip10_all_metrics
 
 data:
-  train_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version5_hdf5/train.h5
-  val_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version5_hdf5/val.h5
-  test_path: null  # Optional, only needed for testing
-
+  train_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version6_hdf5/train.h5
+  val_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version6_hdf5/val.h5
+  test_path: /data/bfys/shenzh/4Dtracking/hepattn/data/lhcb/version6_hdf5/val.h5
+  
   # DataLoader parameters
   batch_size: 32
   num_workers: 2
@@ -21,7 +21,7 @@ data:
   max_vertices: &max_vertices 100
 
   # Path to variable transformation/scaling configuration
-  scale_dict_path: /data/bfys/shenzh/4Dtracking/hepattn/src/hepattn/experiments/lhcb/config/lhcb_var_transform5.yaml
+  scale_dict_path: /data/bfys/shenzh/4Dtracking/hepattn/src/hepattn/experiments/lhcb/config/lhcb_var_transform6.yaml
 
   # Input features (all track features including beamPOCA)
   inputs:
@@ -81,6 +81,17 @@ trainer:
       init_args:
         log_every_n_steps: 10
         log_per_loss_grads: true
+
+    # PredictionWriter: Save predictions during testing
+    # Only active during test stage, won't affect training
+    - class_path: hepattn.callbacks.PredictionWriter
+      init_args:
+        write_inputs: true       # Don't save input features
+        write_outputs: false      # Don't save intermediate outputs
+        write_preds: true         # Save predictions (preds/final)
+        write_targets: true       # Save ground truth targets
+        write_losses: false       # Don't save losses
+        write_layers: ["final"]   # Only save final layer predictions
 
 model:
   optimizer: AdamW

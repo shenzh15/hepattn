@@ -1,396 +1,339 @@
+import operator
 from pathlib import Path
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.stats import beta
+import pandas as pd
+from tqdm import tqdm
+
+from hepattn.experiments.lhcb.performance_study.utils import (
+    MAX_VERTICES,
+    build_true_vertex_info,
+    calculate_clopper_pearson_errors,
+)
 
 
-def load_and_analyze_efficiency_from_hdf5(
-    h5_path,
+def analyze_vertex_efficiency(
+    hdf5_path,
     output_dir="output",
-    track_overlap_threshold=0.7,
+    overlap_threshold=0.7,
     min_tracks=4,
     max_tracks=200,
     bin_width=5,
-    target_vertex_class=0,  # 0=PV, 1=SV, 2=null
+    selected_vertex_class=0,  # 0=PV, 1=SV, 2=null
+    method_name="HepATTn",
 ):
-    """Load predictions and targets from HDF5 file and analyze vertex reconstruction efficiency.
+    """Analyze vertex reconstruction efficiency from HDF5 predictions.
 
-    Uses track-based matching: if the fraction of shared tracks between predicted and true
-    vertex exceeds the threshold, the match is considered successful.
+    Uses track-based matching: a match is successful if both recall and precision
+    of shared tracks exceed the threshold.
 
     Args:
-        h5_path: Path to the HDF5 file
-        output_dir: Output directory for plots
-        track_overlap_threshold: Track overlap threshold for matching
-        min_tracks: Minimum track count (for binning)
-        max_tracks: Maximum track count (for binning)
-        bin_width: Bin width
-        target_vertex_class: Vertex class to analyze (0=PV, 1=SV, 2=null)
-
-    Returns:
-        dict: Efficiency analysis results
+        hdf5_path: Path to the HDF5 file containing predictions and targets
+        output_dir: Output directory for plots and CSV files
+        overlap_threshold: Track overlap threshold for matching (both recall and precision)
+        min_tracks: Minimum track count for binning
+        max_tracks: Maximum track count for binning
+        bin_width: Width of each bin
+        selected_vertex_class: Vertex class to analyze (0=PV, 1=SV, 2=null)
+        method_name: Name of the method for comparison plots
     """
-    # Define equal-width bins
-    track_bins = []
-    bin_idx = 0
-    while min_tracks + bin_width * bin_idx <= max_tracks:
-        bin_start = int(min_tracks + bin_idx * bin_width)
-        bin_end = int(min_tracks + (bin_idx + 1) * bin_width - 1)
-        track_bins.append((bin_start, bin_end))
-        bin_idx += 1
+    # Create equal-width bins for track count
+    num_bins = (max_tracks - min_tracks) // bin_width + 1
+    bins = [(min_tracks + i * bin_width, min_tracks + (i + 1) * bin_width - 1) for i in range(num_bins)]
 
-    # Initialize cumulative counters
-    bin_labels = [f"[{bin_start}, {bin_end}]" for bin_start, bin_end in track_bins]
-    cumulative_true_vertex_counts = dict.fromkeys(bin_labels, 0)  # denominator
-    cumulative_matched_counts = dict.fromkeys(bin_labels, 0)  # numerator
+    # Initialize per-bin counters (using bin tuples as keys)
+    true_vertices_per_bin = dict.fromkeys(bins, 0)
+    matched_vertices_per_bin = dict.fromkeys(bins, 0)
 
-    all_event_true_vertex_track_counts = {}  # Store for potential later use
+    print(f"Loading HDF5 file: {hdf5_path}")
 
-    print(f"Loading HDF5 file: {h5_path}")
-
-    with h5py.File(h5_path, "r") as f:
-        event_ids = sorted([int(k) for k in f])
+    with h5py.File(hdf5_path, "r") as file:
+        event_ids = sorted(int(key) for key in file)
         print(f"Found {len(event_ids)} events")
 
-        for event_idx, event_id in enumerate(event_ids):
-            if event_idx % 500 == 0:
-                print(f"Processing event {event_idx}/{len(event_ids)}...")
+        for event_id in tqdm(event_ids, desc="Processing events"):
+            event_data = file[str(event_id)]
 
-            event_group = f[str(event_id)]
-
-            # Extract targets and predictions
-            targets = event_group["targets"]
-            true_vertex_valid = targets["vertex_valid"][0]
-            true_vertex_tracks = targets["vertex_tracks_valid"][0]
-            true_vertex_class = targets["vertex_class"][0]
+            # Extract targets and predictions from HDF5
+            targets = event_data["targets"]
+            target_vertex_valid = targets["vertex_valid"][0]
+            target_vertex_tracks_valid = targets["vertex_tracks_valid"][0]
+            target_vertex_class = targets["vertex_class"][0]
             tracks_valid = targets["tracks_valid"][0]
 
-            preds = event_group["preds"]["final"]
-            pred_vertex_valid = preds["vertex_classification"]["vertex_valid"][0]
-            pred_vertex_tracks = preds["track_assignment"]["vertex_tracks_valid"][0]
-            pred_vertex_class = preds["vertex_classification"]["vertex_class"][0]
+            predictions = event_data["preds"]["final"]
+            pred_vertex_valid = predictions["vertex_classification"]["vertex_valid"][0]
+            pred_vertex_tracks_valid = predictions["track_assignment"]["vertex_tracks_valid"][0]
+            pred_vertex_class = predictions["vertex_classification"]["vertex_class"][0]
 
-            # Build true vertex info and count tracks
-            event_true_vertex_track_counts, true_vertex_info = _process_true_vertices(
-                true_vertex_valid,
-                true_vertex_class,
-                true_vertex_tracks,
-                tracks_valid,
+            # Build true vertex info
+            true_vertex_info = build_true_vertex_info(
+                target_vertex_valid,
                 target_vertex_class,
+                target_vertex_tracks_valid,
+                tracks_valid,
+                selected_vertex_class,
                 min_tracks,
-                track_bins,
-                bin_labels,
-                cumulative_true_vertex_counts,
             )
 
-            all_event_true_vertex_track_counts[event_id] = event_true_vertex_track_counts
-
-            # Perform track-based matching and update matched counts
-            _process_pred_vertices_and_match(
+            # Process vertices and count true/matched vertices
+            _process_vertices_for_efficiency(
+                true_vertex_info,
                 pred_vertex_valid,
                 pred_vertex_class,
-                pred_vertex_tracks,
+                pred_vertex_tracks_valid,
                 tracks_valid,
-                target_vertex_class,
-                true_vertex_info,
-                track_overlap_threshold,
-                event_true_vertex_track_counts,
-                min_tracks,
-                track_bins,
-                bin_labels,
-                cumulative_matched_counts,
+                selected_vertex_class,
+                overlap_threshold,
+                bins,
+                true_vertices_per_bin,
+                matched_vertices_per_bin,
             )
 
     # Calculate efficiency and errors
-    bin_efficiencies, bin_efficiency_errors = _calculate_efficiencies(
-        bin_labels,
-        cumulative_true_vertex_counts,
-        cumulative_matched_counts,
-    )
+    efficiencies, efficiency_errors = _calculate_efficiencies(bins, true_vertices_per_bin, matched_vertices_per_bin)
 
-    # Overall efficiency
-    total_n_true = sum(cumulative_true_vertex_counts.values())
-    total_n_matched = sum(cumulative_matched_counts.values())
-    total_efficiency = total_n_matched / total_n_true if total_n_true > 0 else 0.0
-    total_efficiency_error = _calculate_total_efficiency_error(total_n_true, total_n_matched, total_efficiency)
+    # Calculate overall efficiency and error bounds
+    overall_stats = _calculate_overall_efficiency(true_vertices_per_bin, matched_vertices_per_bin)
 
-    # Prepare and filter plotting data
-    plot_data = _prepare_plot_data(
-        bin_labels,
-        track_bins,
-        bin_efficiencies,
-        bin_efficiency_errors,
-        cumulative_true_vertex_counts,
-        cumulative_matched_counts,
-    )
+    # Prepare plotting data (filter bins with no data)
+    plot_data = _prepare_plot_data(bins, efficiencies, efficiency_errors, true_vertices_per_bin, matched_vertices_per_bin)
 
     if plot_data is None:
         print("No efficiency data to plot")
-        return None
+        return
 
     # Create and save plot
     _create_efficiency_plot(
         plot_data,
         bin_width,
-        track_overlap_threshold,
+        overlap_threshold,
         output_dir,
-        total_efficiency,
-        total_efficiency_error,
-        total_n_true,
-        total_n_matched,
-        target_vertex_class,
-        bin_labels,
-        bin_efficiencies,
-        bin_efficiency_errors,
+        method_name,
     )
 
-    return {
-        "bin_labels": bin_labels,
-        "track_bins": track_bins,
-        "bin_centers": plot_data["bin_centers"],
-        "efficiencies": list(bin_efficiencies.values()),
-        "efficiency_errors": list(bin_efficiency_errors.values()),
-        "n_true_list": plot_data["n_true_list"],
-        "n_matched_list": plot_data["n_matched_list"],
-        "total_efficiency": total_efficiency,
-        "total_efficiency_error": total_efficiency_error,
-        "all_event_true_vertex_track_counts": all_event_true_vertex_track_counts,
-    }
+    # Print summary results
+    _print_results(
+        overlap_threshold,
+        selected_vertex_class,
+        overall_stats,
+        plot_data["efficiency"],
+        bins,
+        efficiency_errors,
+        true_vertices_per_bin,
+    )
+
+    # Save results to CSV
+    _save_efficiency_to_csv(
+        bins,
+        plot_data,
+        efficiencies,
+        efficiency_errors,
+        true_vertices_per_bin,
+        matched_vertices_per_bin,
+        overall_stats,
+        overlap_threshold,
+        output_dir,
+        method_name,
+    )
 
 
-def _process_true_vertices(
-    true_vertex_valid,
-    true_vertex_class,
-    true_vertex_tracks,
-    tracks_valid,
-    target_vertex_class,
-    min_tracks,
-    track_bins,
-    bin_labels,
-    cumulative_true_vertex_counts,
-):
-    """Process true vertices and update cumulative counts."""
-    event_true_vertex_track_counts = {}
-    true_vertex_info = []
-
-    for vtx_idx in range(100):
-        if not (true_vertex_valid[vtx_idx] and true_vertex_class[vtx_idx] == target_vertex_class):
-            continue
-
-        track_mask = true_vertex_tracks[vtx_idx] & tracks_valid
-        n_tracks = int(track_mask.sum())
-        track_indices = np.where(track_mask)[0]
-
-        true_vertex_info.append({
-            "vertex_id": vtx_idx,
-            "n_tracks": n_tracks,
-            "track_indices": set(track_indices),
-            "vertex_class": int(true_vertex_class[vtx_idx]),
-        })
-        event_true_vertex_track_counts[vtx_idx] = n_tracks
-
-        if n_tracks >= min_tracks:
-            for b_idx, (bin_start, bin_end) in enumerate(track_bins):
-                if bin_start <= n_tracks <= bin_end:
-                    cumulative_true_vertex_counts[bin_labels[b_idx]] += 1
-                    break
-
-    return event_true_vertex_track_counts, true_vertex_info
-
-
-def _process_pred_vertices_and_match(
+def _process_vertices_for_efficiency(
+    true_vertex_info,
     pred_vertex_valid,
     pred_vertex_class,
-    pred_vertex_tracks,
+    pred_vertex_tracks_valid,
     tracks_valid,
-    target_vertex_class,
-    true_vertex_info,
-    track_overlap_threshold,
-    event_true_vertex_track_counts,
-    min_tracks,
-    track_bins,
-    bin_labels,
-    cumulative_matched_counts,
+    selected_vertex_class,
+    overlap_threshold,
+    bins,
+    true_vertices_per_bin,
+    matched_vertices_per_bin,
 ):
-    """Process predicted vertices, perform matching, and update matched counts."""
-    matched_true_vertex_ids = set()
+    """Process vertices and count both denominator and numerator for efficiency.
 
-    for pred_idx in range(100):
-        if not (pred_vertex_valid[pred_idx] and pred_vertex_class[pred_idx] == target_vertex_class):
+    Args:
+        true_vertex_info: Dict of vertex_id to {track_indices} (already filtered by min_tracks)
+        pred_vertex_valid: Array of predicted vertex validity flags
+        pred_vertex_class: Array of predicted vertex class labels
+        pred_vertex_tracks_valid: Array of predicted vertex-track assignments
+        tracks_valid: Array of track validity flags
+        selected_vertex_class: Vertex class to filter (0=PV, 1=SV, 2=null)
+        overlap_threshold: Track overlap threshold for matching
+        bins: List of (bin_start, bin_end) tuples
+        true_vertices_per_bin: Dict to update with true vertex counts (denominator)
+        matched_vertices_per_bin: Dict to update with matched vertex counts (numerator)
+    """
+    # Count true vertices per bin (denominator)
+    for vertex_data in true_vertex_info.values():
+        num_tracks = len(vertex_data["track_indices"])
+
+        # Update bin counts (denominator)
+        for bin_start, bin_end in bins:
+            if bin_start <= num_tracks <= bin_end:
+                true_vertices_per_bin[bin_start, bin_end] += 1
+                break
+
+    # Match predicted vertices and collect all matched true vertex IDs (numerator)
+    matched_true_ids = set()
+    for pred_idx in range(MAX_VERTICES):
+        if not (pred_vertex_valid[pred_idx] and pred_vertex_class[pred_idx] == selected_vertex_class):
             continue
 
-        pred_track_mask = pred_vertex_tracks[pred_idx] & tracks_valid
+        pred_track_mask = pred_vertex_tracks_valid[pred_idx] & tracks_valid
         pred_track_indices = set(np.where(pred_track_mask)[0])
 
-        if len(pred_track_indices) == 0:
+        if not pred_track_indices:
             continue
 
-        best_match_id = _find_best_matching_vertex(
-            pred_track_indices,
-            true_vertex_info,
-            track_overlap_threshold,
-        )
-
+        best_match_id = _find_best_match(pred_track_indices, true_vertex_info, overlap_threshold)
         if best_match_id is not None:
-            matched_true_vertex_ids.add(best_match_id)
+            matched_true_ids.add(best_match_id)
 
-    # Add matched true vertices to numerator bins
-    for matched_id in matched_true_vertex_ids:
-        if matched_id not in event_true_vertex_track_counts:
-            continue
-        n_tracks = event_true_vertex_track_counts[matched_id]
-        if n_tracks >= min_tracks:
-            for b_idx, (bin_start, bin_end) in enumerate(track_bins):
-                if bin_start <= n_tracks <= bin_end:
-                    cumulative_matched_counts[bin_labels[b_idx]] += 1
-                    break
+    # Fill all collected matched vertices per bin (numerator)
+    for matched_id in matched_true_ids:
+        num_tracks = len(true_vertex_info[matched_id]["track_indices"])
+        for bin_start, bin_end in bins:
+            if bin_start <= num_tracks <= bin_end:
+                matched_vertices_per_bin[bin_start, bin_end] += 1
+                break
 
 
-def _find_best_matching_vertex(pred_track_indices, true_vertex_info, track_overlap_threshold):
-    """Find the best matching true vertex based on track overlap.
+def _find_best_match(pred_track_indices, true_vertex_info, overlap_threshold):
+    """Find the best matching true vertex for a predicted vertex.
 
     A match requires BOTH:
-    - true_overlap_ratio (recall) = intersection / true_n_tracks >= threshold
-    - rec_overlap_ratio (purity) = intersection / rec_n_tracks >= threshold
+    - Recall = intersection / num_true_tracks >= threshold
+    - Precision = intersection / num_pred_tracks >= threshold
+
+    Returns:
+        Best matching vertex ID or None if no match found
     """
     best_match_id = None
-    best_true_overlap = 0
+    best_recall = 0.0
 
-    rec_n_tracks = len(pred_track_indices)
-    if rec_n_tracks == 0:
+    num_pred_tracks = len(pred_track_indices)
+    if num_pred_tracks == 0:
         return None
 
-    for true_vtx in true_vertex_info:
-        true_track_indices = true_vtx["track_indices"]
-        if len(true_track_indices) == 0:
+    for vertex_id, vertex_data in true_vertex_info.items():
+        true_track_indices = vertex_data["track_indices"]
+        num_true_tracks = len(true_track_indices)
+
+        if num_true_tracks == 0:
             continue
 
-        intersection = len(pred_track_indices & true_track_indices)
-        true_overlap_ratio = intersection / len(true_track_indices)  # recall
-        rec_overlap_ratio = intersection / rec_n_tracks  # purity
+        # Calculate overlap metrics
+        num_shared = len(pred_track_indices & true_track_indices)
+        recall = num_shared / num_true_tracks
+        precision = num_shared / num_pred_tracks
 
-        # Both recall and purity must be >= threshold
-        if true_overlap_ratio >= track_overlap_threshold and rec_overlap_ratio >= track_overlap_threshold and true_overlap_ratio > best_true_overlap:
-            best_true_overlap = true_overlap_ratio
-            best_match_id = true_vtx["vertex_id"]
+        # Both recall and precision must exceed threshold, and recall should be best so far
+        if recall >= overlap_threshold and precision >= overlap_threshold and recall > best_recall:
+            best_recall = recall
+            best_match_id = vertex_id
 
     return best_match_id
 
 
-def _calculate_efficiencies(bin_labels, cumulative_true_vertex_counts, cumulative_matched_counts):
-    """Calculate efficiency and Clopper-Pearson errors for each bin."""
-    bin_efficiencies = {}
-    bin_efficiency_errors = {}
+def _calculate_efficiencies(bins, true_vertices_per_bin, matched_vertices_per_bin):
+    """Calculate efficiency and Clopper-Pearson confidence intervals for each bin."""
+    efficiencies = {}
+    errors = {}
 
-    for bin_label in bin_labels:
-        n_true = cumulative_true_vertex_counts[bin_label]
-        n_matched = cumulative_matched_counts[bin_label]
-        efficiency = n_matched / n_true if n_true > 0 else 0.0
-        bin_efficiencies[bin_label] = efficiency
+    for bin_tuple in bins:
+        num_true = true_vertices_per_bin[bin_tuple]
+        num_matched = matched_vertices_per_bin[bin_tuple]
+        efficiency = num_matched / num_true if num_true > 0 else 0.0
+        efficiencies[bin_tuple] = efficiency
 
-        if n_true > 0:
-            k, n = n_matched, n_true
-            lower_bound = beta.ppf(0.1585, k, n - k + 1) if k > 0 else 0.0
-            upper_bound = beta.ppf(0.8415, k + 1, n - k) if k < n else 1.0
+        error_lower, error_upper = calculate_clopper_pearson_errors(num_matched, num_true, efficiency)
+        errors[bin_tuple] = {"lower": error_lower, "upper": error_upper}
 
-            if np.isnan(lower_bound) or np.isnan(upper_bound):
-                bin_efficiency_errors[bin_label] = {"lower": 0.0, "upper": 0.0}
-            else:
-                bin_efficiency_errors[bin_label] = {
-                    "lower": efficiency - lower_bound,
-                    "upper": upper_bound - efficiency,
-                }
-        else:
-            bin_efficiency_errors[bin_label] = {"lower": 0.0, "upper": 0.0}
-
-    return bin_efficiencies, bin_efficiency_errors
+    return efficiencies, errors
 
 
-def _calculate_total_efficiency_error(total_n_true, total_n_matched, total_efficiency):
-    """Calculate overall efficiency error using Clopper-Pearson method."""
-    if total_n_true == 0:
-        return 0.0
+def _calculate_overall_efficiency(true_vertices_per_bin, matched_vertices_per_bin):
+    """Calculate overall efficiency and error bounds.
 
-    k_total, n_total = total_n_matched, total_n_true
-    lower_total = beta.ppf(0.1585, k_total, n_total - k_total + 1) if k_total > 0 else 0.0
-    upper_total = beta.ppf(0.8415, k_total + 1, n_total - k_total) if k_total < n_total else 1.0
+    Returns:
+        dict: Dictionary containing overall statistics:
+            - efficiency: overall efficiency value
+            - error_lower: lower error bound
+            - error_upper: upper error bound
+            - total_true: total number of true vertices
+            - total_matched: total number of matched vertices
+    """
+    total_true = sum(true_vertices_per_bin.values())
+    total_matched = sum(matched_vertices_per_bin.values())
+    overall_efficiency = total_matched / total_true if total_true > 0 else 0.0
 
-    return (total_efficiency - lower_total + upper_total - total_efficiency) / 2
-
-
-def _prepare_plot_data(
-    bin_labels,
-    track_bins,
-    bin_efficiencies,
-    bin_efficiency_errors,
-    cumulative_true_vertex_counts,
-    cumulative_matched_counts,
-):
-    """Prepare data for plotting, filtering bins with no data."""
-    bin_centers = [(s + e) / 2 for s, e in track_bins]
-    n_true_list = [cumulative_true_vertex_counts[label] for label in bin_labels]
-    n_matched_list = [cumulative_matched_counts[label] for label in bin_labels]
-
-    x_plot, eff_plot, err_lower_plot, err_upper_plot = [], [], [], []
-    n_true_plot, n_matched_plot = [], []
-
-    for idx, center in enumerate(bin_centers):
-        if n_true_list[idx] > 0:
-            x_plot.append(center)
-            eff_plot.append(bin_efficiencies[bin_labels[idx]])
-            err_lower_plot.append(bin_efficiency_errors[bin_labels[idx]]["lower"])
-            err_upper_plot.append(bin_efficiency_errors[bin_labels[idx]]["upper"])
-            n_true_plot.append(n_true_list[idx])
-            n_matched_plot.append(n_matched_list[idx])
-
-    if not x_plot:
-        return None
+    # Calculate Clopper-Pearson confidence intervals
+    error_lower, error_upper = calculate_clopper_pearson_errors(total_matched, total_true, overall_efficiency)
 
     return {
-        "x_plot": x_plot,
-        "eff_plot": eff_plot,
-        "err_lower_plot": err_lower_plot,
-        "err_upper_plot": err_upper_plot,
-        "n_true_plot": n_true_plot,
-        "n_matched_plot": n_matched_plot,
-        "bin_centers": bin_centers,
-        "n_true_list": n_true_list,
-        "n_matched_list": n_matched_list,
+        "efficiency": overall_efficiency,
+        "error_lower": error_lower,
+        "error_upper": error_upper,
+        "total_true": total_true,
+        "total_matched": total_matched,
     }
 
 
-def _create_efficiency_plot(
-    plot_data,
-    bin_width,
-    track_overlap_threshold,
-    output_dir,
-    total_efficiency,
-    total_efficiency_error,
-    total_n_true,
-    total_n_matched,
-    target_vertex_class,
-    bin_labels,
-    bin_efficiencies,
-    bin_efficiency_errors,
-):
-    """Create and save the efficiency plot."""
-    x_plot = plot_data["x_plot"]
-    eff_plot = plot_data["eff_plot"]
-    n_true_plot = plot_data["n_true_plot"]
-    n_matched_plot = plot_data["n_matched_plot"]
+def _prepare_plot_data(bins, efficiencies, efficiency_errors, true_vertices_per_bin, matched_vertices_per_bin):
+    """Prepare data for plotting, filtering out bins with no data."""
+    bin_centers = [(start + end) / 2 for start, end in bins]
+    num_true_list = [true_vertices_per_bin[bin_tuple] for bin_tuple in bins]
+    num_matched_list = [matched_vertices_per_bin[bin_tuple] for bin_tuple in bins]
+
+    # Filter bins with data
+    x_values, eff_values, err_lower, err_upper = [], [], [], []
+    num_true_filtered, num_matched_filtered = [], []
+
+    for idx, bin_tuple in enumerate(bins):
+        if num_true_list[idx] > 0:
+            x_values.append(bin_centers[idx])
+            eff_values.append(efficiencies[bin_tuple])
+            err_lower.append(efficiency_errors[bin_tuple]["lower"])
+            err_upper.append(efficiency_errors[bin_tuple]["upper"])
+            num_true_filtered.append(num_true_list[idx])
+            num_matched_filtered.append(num_matched_list[idx])
+
+    if not x_values:
+        return None
+
+    return {
+        "x": x_values,
+        "efficiency": eff_values,
+        "error_lower": err_lower,
+        "error_upper": err_upper,
+        "num_true_filtered": num_true_filtered,
+        "num_matched_filtered": num_matched_filtered,
+        "bin_centers": bin_centers,
+        "num_true_all": num_true_list,
+        "num_matched_all": num_matched_list,
+    }
+
+
+def _create_efficiency_plot(plot_data, bin_width, overlap_threshold, output_dir, method_name):
+    """Create and save the efficiency plot with confidence intervals."""
+    x = plot_data["x"]
+    efficiency = plot_data["efficiency"]
+    num_true = plot_data["num_true_filtered"]
+    num_matched = plot_data["num_matched_filtered"]
 
     _, ax1 = plt.subplots(figsize=(9, 6))
     ax2 = ax1.twinx()
 
-    # Efficiency plot with confidence interval
-    lower_bounds = [eff - err for eff, err in zip(eff_plot, plot_data["err_lower_plot"], strict=True)]
-    upper_bounds = [eff + err for eff, err in zip(eff_plot, plot_data["err_upper_plot"], strict=True)]
+    # Plot efficiency with confidence intervals
+    lower_bounds = [eff - err for eff, err in zip(efficiency, plot_data["error_lower"], strict=True)]
+    upper_bounds = [eff + err for eff, err in zip(efficiency, plot_data["error_upper"], strict=True)]
 
-    ax1.plot(x_plot, eff_plot, "bo-", linewidth=2, markersize=8, label="Efficiency (Track-based)")
+    ax1.plot(x, efficiency, "bo-", linewidth=2, markersize=8, label="Efficiency (Track-based)")
     ax1.fill_between(
-        x_plot,
+        x,
         lower_bounds,
         upper_bounds,
         alpha=0.3,
@@ -398,24 +341,24 @@ def _create_efficiency_plot(
         label="Clopper-Pearson 1-sigma CI",
     )
 
-    ax1.set_xlabel("Number of tracks of primary vertex", fontsize=12)
+    ax1.set_xlabel("Number of tracks per primary vertex", fontsize=12)
     ax1.set_ylabel("Efficiency", fontsize=12)
     ax1.set_title(
-        f"Vertex Reconstruction Efficiency vs Track Count\nTrack overlap threshold: {track_overlap_threshold}",
+        f"Vertex Reconstruction Efficiency vs Track Count\nOverlap threshold: {overlap_threshold}",
         fontsize=14,
     )
     ax1.set_ylim(0, 1.27)
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc="upper left")
 
-    # Bar plot
-    x_pos = np.array(x_plot)
-    max_vertex_count = max(max(n_true_plot), max(n_matched_plot))
-    ax2_max = max_vertex_count * 2.3
+    # Add bar charts for counts
+    x_array = np.array(x)
+    max_count = max(max(num_true), max(num_matched))
+    y_max = max_count * 2.3
 
     ax2.bar(
-        x_pos,
-        n_true_plot,
+        x_array,
+        num_true,
         bin_width,
         alpha=0.8,
         color="lightblue",
@@ -423,8 +366,8 @@ def _create_efficiency_plot(
         linewidth=0.5,
     )
     ax2.bar(
-        x_pos,
-        n_matched_plot,
+        x_array,
+        num_matched,
         bin_width,
         alpha=0.9,
         color="darkorange",
@@ -432,31 +375,28 @@ def _create_efficiency_plot(
         linewidth=0.5,
     )
 
-    ax2.set_ylim(0, ax2_max)
+    ax2.set_ylim(0, y_max)
     ax2.set_yticklabels([])
     ax2.tick_params(axis="y", which="both", length=0)
     ax2.legend(loc="upper right")
 
-    # Add numerical labels
-    for x, n_true, n_matched in zip(x_pos, n_true_plot, n_matched_plot, strict=True):
+    # Add numerical labels on bars
+    for x_pos, n_true, n_matched in zip(x_array, num_true, num_matched, strict=True):
         if n_true > 0:
             ax2.text(
-                x,
-                n_true + ax2_max * 0.03,
+                x_pos,
+                n_true + y_max * 0.03,
                 str(n_true),
                 ha="center",
                 va="bottom",
                 fontsize=7,
-                weight="normal",
                 color="darkblue",
                 bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
             )
         if n_matched > 0:
-            y_pos = n_matched / 2
-            if n_matched < max_vertex_count * 0.15:
-                y_pos = n_matched + ax2_max * 0.01
+            y_pos = n_matched / 2 if n_matched >= max_count * 0.15 else n_matched + y_max * 0.01
             ax2.text(
-                x,
+                x_pos,
                 y_pos,
                 str(n_matched),
                 ha="center",
@@ -472,92 +412,143 @@ def _create_efficiency_plot(
     # Save plot
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    plot_file = output_path / "vertex_efficiency_hdf5.pdf"
+    plot_file = output_path / f"efficiency_{method_name.lower().replace(' ', '_')}.pdf"
     plt.savefig(plot_file, dpi=300, bbox_inches="tight")
     plt.close()
 
-    # Print results
-    _print_results(
-        track_overlap_threshold,
-        target_vertex_class,
-        total_efficiency,
-        total_efficiency_error,
-        total_n_true,
-        total_n_matched,
-        eff_plot,
-        bin_labels,
-        bin_efficiencies,
-        bin_efficiency_errors,
-        plot_file,
-    )
-
 
 def _print_results(
-    track_overlap_threshold,
-    target_vertex_class,
-    total_efficiency,
-    total_efficiency_error,
-    total_n_true,
-    total_n_matched,
-    eff_plot,
-    bin_labels,
-    bin_efficiencies,
-    bin_efficiency_errors,
-    output_path,
+    overlap_threshold,
+    selected_vertex_class,
+    overall_stats,
+    efficiency_values,
+    bins,
+    efficiency_errors,
+    true_vertices_per_bin,
 ):
-    """Print efficiency analysis summary."""
+    """Print efficiency analysis summary to console."""
     class_names = {0: "PV", 1: "SV", 2: "null"}
+
     print(f"\n{'-' * 60}")
     print("EFFICIENCY ANALYSIS SUMMARY - HDF5 DATA")
     print(f"{'-' * 60}")
-    print(f"Track overlap threshold: {track_overlap_threshold}")
-    print(f"Vertex class: {target_vertex_class} ({class_names.get(target_vertex_class, 'unknown')})")
-    print(f"Overall efficiency: {total_efficiency:.3f} +/- {total_efficiency_error:.3f} ({total_n_matched}/{total_n_true})")
+    print(f"Track overlap threshold: {overlap_threshold}")
+    print(f"Vertex class: {selected_vertex_class} ({class_names.get(selected_vertex_class, 'unknown')})")
+    eff = overall_stats["efficiency"]
+    err_upper = overall_stats["error_upper"]
+    err_lower = overall_stats["error_lower"]
+    matched = overall_stats["total_matched"]
+    total = overall_stats["total_true"]
+    print(f"Overall efficiency: {eff:.3f} +{err_upper:.3f}/-{err_lower:.3f} ({matched}/{total})")
 
-    if eff_plot:
-        best_eff_idx = np.argmax(eff_plot)
-        worst_eff_idx = np.argmin([e for e in eff_plot if e > 0] or [0])
+    if efficiency_values:
+        # Map efficiency values to bins (only bins with data)
+        bins_with_data = [bin_tuple for bin_tuple in bins if true_vertices_per_bin[bin_tuple] > 0]
 
-        # Find corresponding bin indices
-        eff_values = list(bin_efficiencies.values())
-        n_true_values = [1 if bin_efficiencies[label] > 0 else 0 for label in bin_labels]
+        # Find best efficiency
+        best_idx = int(np.argmax(efficiency_values))
+        best_bin = bins_with_data[best_idx]
+        best_eff = efficiency_values[best_idx]
+        best_err = efficiency_errors[best_bin]
 
-        best_bin_idx = 0
-        worst_bin_idx = 0
-        plot_count = 0
-        for idx, n_true in enumerate(n_true_values):
-            if eff_values[idx] > 0 or n_true > 0:
-                if plot_count == best_eff_idx:
-                    best_bin_idx = idx
-                if plot_count == worst_eff_idx:
-                    worst_bin_idx = idx
-                plot_count += 1
+        # Find worst efficiency (excluding zero)
+        non_zero_effs = [(i, eff) for i, eff in enumerate(efficiency_values) if eff > 0]
+        if non_zero_effs:
+            worst_idx, worst_eff = min(non_zero_effs, key=operator.itemgetter(1))
+            worst_bin = bins_with_data[worst_idx]
+            worst_err = efficiency_errors[worst_bin]
+            print(f"Best efficiency: {best_eff:.3f} +{best_err['upper']:.3f}/-{best_err['lower']:.3f} in bin [{best_bin[0]}, {best_bin[1]}]")
+            print(f"Worst efficiency: {worst_eff:.3f} +{worst_err['upper']:.3f}/-{worst_err['lower']:.3f} in bin [{worst_bin[0]}, {worst_bin[1]}]")
+        else:
+            print(f"Best efficiency: {best_eff:.3f} +{best_err['upper']:.3f}/-{best_err['lower']:.3f} in bin [{best_bin[0]}, {best_bin[1]}]")
 
-        best_err = bin_efficiency_errors[bin_labels[best_bin_idx]]
-        worst_err = bin_efficiency_errors[bin_labels[worst_bin_idx]]
-
-        best_eff = eff_plot[best_eff_idx]
-        worst_eff = eff_plot[worst_eff_idx]
-        print(f"Best efficiency: {best_eff:.3f} +{best_err['upper']:.3f}/-{best_err['lower']:.3f} in bin {bin_labels[best_bin_idx]}")
-        print(f"Worst efficiency: {worst_eff:.3f} +{worst_err['upper']:.3f}/-{worst_err['lower']:.3f} in bin {bin_labels[worst_bin_idx]}")
-
-    print(f"Total true vertices analyzed: {total_n_true}")
-    print(f"Total matched vertices: {total_n_matched}")
-    print(f"Output saved to: {output_path}")
+    print(f"Total true vertices analyzed: {overall_stats['total_true']}")
+    print(f"Total matched vertices: {overall_stats['total_matched']}")
     print(f"{'-' * 60}\n")
 
 
-if __name__ == "__main__":
-    # Example usage
-    h5_file = "epoch=099-val_loss=8.19651_version5_hdf5_eval.h5"
-    out_dir = "output"
+def _save_efficiency_to_csv(
+    bins,
+    plot_data,
+    efficiencies,
+    efficiency_errors,
+    true_vertices_per_bin,
+    matched_vertices_per_bin,
+    overall_stats,
+    overlap_threshold,
+    output_dir,
+    method_name,
+):
+    """Save efficiency results to CSV files for comparison with other methods."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    results = load_and_analyze_efficiency_from_hdf5(
-        h5_path=h5_file,
-        output_dir=out_dir,
-        track_overlap_threshold=0.7,
-        min_tracks=4,
-        max_tracks=200,
-        bin_width=5,
-        target_vertex_class=0,  # 0=PV, 1=SV, 2=null
+    # Save detailed per-bin results
+    bin_data = []
+    for i, bin_tuple in enumerate(bins):
+        bin_start, bin_end = bin_tuple
+        bin_center = plot_data["bin_centers"][i]
+        efficiency = efficiencies[bin_tuple]
+        error_lower = efficiency_errors[bin_tuple]["lower"]
+        error_upper = efficiency_errors[bin_tuple]["upper"]
+        num_true = true_vertices_per_bin[bin_tuple]
+        num_matched = matched_vertices_per_bin[bin_tuple]
+
+        bin_data.append({
+            "bin_start": bin_start,
+            "bin_end": bin_end,
+            "bin_center": bin_center,
+            "efficiency": efficiency,
+            "error_lower": error_lower,
+            "error_upper": error_upper,
+            "num_true": num_true,
+            "num_matched": num_matched,
+        })
+
+    df = pd.DataFrame(bin_data)
+    csv_path = output_path / f"efficiency_{method_name.lower().replace(' ', '_')}.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved bin-level efficiency results to: {csv_path}")
+
+    # Save overall summary
+    summary_df = pd.DataFrame([
+        {
+            "total_matched": overall_stats["total_matched"],
+            "total_true": overall_stats["total_true"],
+            "overall_efficiency": overall_stats["efficiency"],
+            "overall_error_lower": overall_stats["error_lower"],
+            "overall_error_upper": overall_stats["error_upper"],
+            "overlap_threshold": overlap_threshold,
+            "method_name": method_name,
+        }
+    ])
+
+    summary_path = output_path / f"efficiency_summary_{method_name.lower().replace(' ', '_')}.csv"
+    summary_df.to_csv(summary_path, index=False)
+    print(f"Saved overall efficiency summary to: {summary_path}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Analyze vertex reconstruction efficiency from HDF5 predictions file")
+    parser.add_argument("--hdf5_path", type=str, required=True, help="Path to the HDF5 file containing predictions and targets")
+    parser.add_argument("--output_dir", type=str, default="output", help="Output directory for plots and CSV files")
+    parser.add_argument("--overlap_threshold", type=float, default=0.7, help="Track overlap threshold for matching")
+    parser.add_argument("--min_tracks", type=int, default=4, help="Minimum track count for binning")
+    parser.add_argument("--max_tracks", type=int, default=200, help="Maximum track count for binning")
+    parser.add_argument("--bin_width", type=int, default=5, help="Bin width for track count histogram")
+    parser.add_argument("--selected_vertex_class", type=int, default=0, help="Vertex class to analyze: 0=PV, 1=SV, 2=null")
+    parser.add_argument("--method_name", type=str, default="HepATTn", help="Method name for comparison plots and CSV files")
+    args = parser.parse_args()
+
+    analyze_vertex_efficiency(
+        hdf5_path=args.hdf5_path,
+        output_dir=args.output_dir,
+        overlap_threshold=args.overlap_threshold,
+        min_tracks=args.min_tracks,
+        max_tracks=args.max_tracks,
+        bin_width=args.bin_width,
+        selected_vertex_class=args.selected_vertex_class,
+        method_name=args.method_name,
     )
