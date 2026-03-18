@@ -1,0 +1,44 @@
+e:
+  type: std
+  mean: 0.0
+  std: 5000.0
+
+eF:
+  type: std
+  mean: 0.0
+  std: 5000.0
+
+eB:
+  type: std
+  mean: 0.0
+  std: 5000.0
+
+x:
+  type: std
+  mean: 0.0
+  std: 3000.0
+
+y:
+  type: std
+  mean: 0.0
+  std: 3000.0
+
+z:
+  type: std
+  mean: 0.0
+  std: 12620.0
+
+t:
+  type: std
+  mean: 0.0
+  std: 10.0
+
+tF:
+  type: std
+  mean: 0.0
+  std: 10.0
+
+tB:
+  type: std
+  mean: 0.0
+  std: 10.0
