@@ -1,0 +1,222 @@
+name: ECAL_Synthetic_Test
+
+matmul_precision: high
+
+data:
+  # Use synthetic data
+  train_dir: data/synthetic_ecal
+  val_dir: data/synthetic_ecal
+  test_dir: data/synthetic_ecal
+
+  num_workers: 0
+  num_train: 10
+  num_test: 5
+  num_val: 5
+
+  batch_size: 2
+
+  scale_dict_path: configs/ecal_var_transform.yaml
+
+  input_dtype: float32
+  target_dtype: float32
+
+  input_pad_value: 0.0
+  target_pad_value: 0.0
+
+  # Quality cuts
+  min_cluster_energy: 0.0
+  min_num_cells: 3
+  min_num_clusters: 1
+
+  # Padding sizes
+  force_pad_sizes:
+    cluster: &num_clusters 10
+    cell: &num_cells 512
+
+  skip_pad_items: []
+  sampling_seed: 42
+
+  # Input cell features
+  inputs:
+    cell:
+      - log_eF
+      - log_eB
+      - x_norm
+      - y_norm
+      - z_norm
+      - tF
+      - tB
+      - dx_norm
+      - dy_norm
+      - region_norm
+
+  # Target fields
+  targets:
+    cluster:
+      - e
+      - eF
+      - eB
+      - x
+      - y
+      - z
+      - t
+      - tF
+      - tB
+
+    cluster_cell: []
+
+# Training configuration
+trainer:
+  max_epochs: 2
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  log_every_n_steps: 5
+  default_root_dir: logs/test_synthetic
+  gradient_clip_val: 0.1
+  accumulate_grad_batches: 1
+  enable_progress_bar: True
+  fast_dev_run: 5  # Quick test run
+
+  logger: null  # Disable logger for test
+
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 1
+
+model:
+  optimizer: AdamW
+
+  lrs_config:
+    initial: 1e-5
+    max: 3e-4
+    end: 1e-6
+    pct_start: 0.05
+    skip_scheduler: false
+    weight_decay: 1e-4
+
+  mtl: false
+
+  model:
+    class_path: hepattn.models.MaskFormer
+    init_args:
+      dim: &dim 64  # Smaller for faster testing
+      target_object: cluster
+      input_sort_field: x_norm
+
+      input_nets:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            - class_path: hepattn.models.InputNet
+              init_args:
+                input_name: cell
+                input_dtype: float32
+                fields:
+                  - log_eF
+                  - log_eB
+                  - x_norm
+                  - y_norm
+                  - z_norm
+                  - tF
+                  - tB
+                  - dx_norm
+                  - dy_norm
+                  - region_norm
+                net:
+                  class_path: hepattn.models.Dense
+                  init_args:
+                    input_size: 10
+                    output_size: *dim
+                posenc:
+                  class_path: hepattn.models.posenc.PositionEncoder
+                  init_args:
+                    input_name: cell
+                    dim: *dim
+                    fields:
+                      - x_norm
+                      - y_norm
+
+      encoder:
+        class_path: hepattn.models.Encoder
+        init_args:
+          num_layers: 2  # Reduced for testing
+          dim: *dim
+          attn_type: torch
+          hybrid_norm: true
+          value_residual: true
+          attn_kwargs:
+            num_heads: 4
+
+      decoder:
+        num_decoder_layers: 2  # Reduced for testing
+        num_queries: *num_clusters
+        mask_attention: true
+        use_query_masks: false
+        decoder_layer_config:
+          dim: *dim
+          hybrid_norm: true
+          attn_kwargs:
+            num_heads: 4
+
+      matcher:
+        class_path: hepattn.models.matcher.Matcher
+        init_args:
+          default_solver: scipy
+          adaptive_solver: false
+          parallel_solver: true
+
+      tasks:
+        class_path: torch.nn.ModuleList
+        init_args:
+          modules:
+            - class_path: hepattn.models.task.ObjectClassificationTask
+              init_args:
+                name: cluster_valid
+                input_object: query
+                output_object: cluster
+                target_object: cluster
+                losses:
+                  object_bce: 5.0
+                costs:
+                  object_bce: 5.0
+                dim: *dim
+                null_weight: 0.5
+                mask_queries: false
+                has_intermediate_loss: true
+                has_first_layer_loss: false
+
+            - class_path: hepattn.models.task.ObjectHitMaskTask
+              init_args:
+                name: cluster_cell_assignment
+                input_constituent: cell
+                input_object: query
+                output_object: cluster
+                target_object: cluster
+                target_field: valid
+                has_intermediate_loss: true
+                losses:
+                  mask_bce: 0.25
+                  mask_dice: 0.75
+                costs:
+                  mask_bce: 0.25
+                  mask_dice: 0.75
+                dim: *dim
+                null_weight: 0.1
+
+            - class_path: hepattn.models.task.ObjectRegressionTask
+              init_args:
+                name: cluster_regression
+                input_object: query
+                output_object: cluster
+                target_object: cluster
+                has_intermediate_loss: true
+                fields:
+                  - e
+                  - x
+                  - y
+                loss_weight: 1.0
+                cost_weight: 1.0
+                dim: *dim
+                loss: smooth_l1
